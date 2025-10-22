@@ -1,0 +1,160 @@
+- name: Install Falcon Sensor on Oracle Linux
+  hosts: nodes
+  become: yes
+  gather_facts: no
+  vars:
+    http_proxy: "http://192.168.16.162:80"
+    https_proxy: "http://192.168.16.162:80"
+    no_proxy: "localhost,10.0.0.0/8,169.254.169.254,127.0.0.1,.oci.customer-oci.com,.ocs.oc-test.com,.ocir.io,.osm.org"
+
+  tasks:
+    - name: Check if Falcon Sensor is already installed
+      stat:
+        path: /opt/CrowdStrike/falconctl
+      register: falconctl_check
+
+    - name: Copy Falcon Sensor installation script
+      copy:
+        dest: /tmp/install_falcon.sh
+        mode: '0755'
+        content: |
+          #!/bin/bash
+          set -euo pipefail
+          IFS=$'\n\t'
+          readonly PAR_URL="https://objectstorage.us-ashburn-1.oraclecloud.com/p/ClQ-CBkNs1vHgJtCrzenAbxjjMMddVQJT6VDaPOZGWaUwenVvRJYe3CivYfShHfL/n/idv5itwbfamt/b/falcon-sensor-installers/o/"
+          readonly SENSOR_NAME_TEMPLATE='falcon-sensor-7.24.0-17706.elOS_VERSION.ARCH.rpm'
+          readonly OCI_CID='4D431622DC594EC69ED15C9B27AC6527-2A'
+          readonly GIU_CID='35E4948D55324A60A8AA2F4D39AB617E-04'
+          readonly FA_CID='6faddccee424429994616e8642e8213c'
+          readonly SAAS_CID='8400463988F447AFBCAA0D9C09097E6A-82'
+          cid_to_use=${CID:-$GIU_CID}
+          TMP_RPM=""
+          cleanup() { if [[ -n "${TMP_RPM:-}" && -f "$TMP_RPM" ]]; then rm -f "$TMP_RPM" || true; fi; }
+          trap cleanup EXIT
+          command_exists() { command -v "$1" >/dev/null 2>&1; }
+          object_get() { local url=$1; local path=$2; printf 'Fetching %s -> %s\n' "$url" "$path"; curl --fail --show-error --location --silent "$url" -o "$path"; }
+          fetch_and_load() {
+            local arch=$1
+            if [[ ! -f "/etc/oracle-release" ]]; then
+              printf "Falcon sensor can only be installed on Oracle Linux!\n" >&2
+              exit 1
+            fi
+            local osver
+            osver=$(grep -oE '[0-9]+' /etc/oracle-release | head -n1 || true)
+            if [[ -z "$osver" ]]; then
+              printf "Unable to determine Oracle Linux version from /etc/oracle-release\n" >&2
+              exit 1
+            fi
+            local sensor_name
+            sensor_name=${SENSOR_NAME_TEMPLATE/ARCH/$arch}
+            sensor_name=${sensor_name/OS_VERSION/$osver}
+            local full_url="${PAR_URL}${sensor_name}"
+            TMP_RPM=$(mktemp -u /tmp/falcon-sensor.XXXXXX.rpm)
+            object_get "$full_url" "$TMP_RPM"
+            if ! sudo yum install -y "$TMP_RPM"; then
+              printf "falcon sensor install failed\n" >&2
+              exit 1
+            fi
+            printf "Sensor installed, removing tmp RPM\n"
+            rm -f "$TMP_RPM" || true
+            activate_and_validate
+          }
+          activate_and_validate() {
+            if ! sudo /opt/CrowdStrike/falconctl -s --cid="$cid_to_use" -f; then
+              printf "falcon sensor CID enablement failed\n" >&2
+              exit 1
+            fi
+            printf "Sensor CID enabled, configuring proxy and restarting sensor\n"
+            sudo /opt/CrowdStrike/falconctl -s --apd=false || true
+            sudo /opt/CrowdStrike/falconctl -s --aph=192.168.16.162 || true
+            sudo /opt/CrowdStrike/falconctl -s --app=80 || true
+            sudo systemctl restart falcon-sensor
+            sleep 5
+            if ! systemctl is-active --quiet falcon-sensor; then
+              printf "falcon sensor state validation failed\n" >&2
+              sudo journalctl -u falcon-sensor --no-pager -n 50 || true
+              exit 1
+            fi
+            printf "Falcon Sensor successfully installed!\n"
+          }
+          if [[ -f "/etc/oracle-release" ]]; then
+            printf "Running on OS version: %s\n" "$(cat /etc/oracle-release)"
+          else
+            printf "Falcon sensor can only be installed on Oracle Linux!\n" >&2
+            exit 1
+          fi
+          case "$(uname -m)" in
+            x86_64) fetch_and_load x86_64 ;;
+            aarch64) fetch_and_load aarch64 ;;
+            *) printf "Unsupported architecture: %s\n" "$(uname -m)" >&2; exit 1 ;;
+          esac
+          sleep 15
+          sudo /opt/CrowdStrike/falconctl -g --version || true
+          systemctl status falcon-sensor || true
+
+    - name: Run Falcon Sensor installer if not already installed
+      shell: /tmp/install_falcon.sh
+      args:
+        executable: /bin/bash
+      when: not falconctl_check.stat.exists
+      register: falcon_output
+
+    - name: Show Falcon installation output
+      when: falcon_output is defined
+      debug:
+        var: falcon_output.stdout
+
+    - name: Grow filesystem if not already expanded
+      become: yes
+      command: /usr/libexec/oci-growfs -y
+      args:
+        creates: /var/lib/oci-growfs-done
+      register: growfs_result
+
+    - name: Mark growfs done
+      become: yes
+      file:
+        path: /var/lib/oci-growfs-done
+        state: touch
+      when: growfs_result.changed
+
+    - name: Ensure CRI-O systemd override directory exists
+      file:
+        path: /etc/systemd/system/crio.service.d
+        state: directory
+        mode: '0755'
+
+    - name: Configure CRI-O HTTP proxy
+      copy:
+        dest: /etc/systemd/system/crio.service.d/http-proxy.conf
+        content: |
+          [Service]
+          Environment="HTTP_PROXY={{ http_proxy }}"
+          Environment="HTTPS_PROXY={{ https_proxy }}"
+          Environment="NO_PROXY={{ no_proxy }}"
+        owner: root
+        group: root
+        mode: '0644'
+
+    - name: Reload systemd
+      command: systemctl daemon-reload
+
+    - name: Show CRI-O environment configuration
+      command: systemctl show --property=Environment crio
+      register: crio_env
+
+    - debug:
+        var: crio_env.stdout_lines
+
+    - name: Restart CRI-O service
+      service:
+        name: crio
+        state: restarted
+
+    - name: Check CRI-O status
+      command: systemctl status crio --no-pager -l
+      register: crio_status
+      changed_when: false
+
+    - debug:
+        var: crio_status.stdout_lines

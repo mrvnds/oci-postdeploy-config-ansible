@@ -1,0 +1,109 @@
+version: 0.1
+component: build
+timeoutInSeconds: 7200
+shell: bash
+failImmediatelyOnError: true
+
+env:
+  variables:
+    HTTP_PROXY: http://192.168.16.162:80
+    HTTPS_PROXY: http://192.168.16.162:80
+    NO_PROXY: localhost,127.0.0.1,.oraclecloud.com,.ocir.io
+  vaultVariables:
+    OCI_FINGERPRINT: "ocid1.vaultsecret.oc1.iad.amaaaaaagwh32gqawnotfizj6nhasg4boaq55tryr3tzys3nfx62o5nst4sq"
+    OCI_PRIVATE_KEY: "ocid1.vaultsecret.oc1.iad.amaaaaaagwh32gqa2pghqnzv7lbym7ezuvas3xye2bnznsh7apkkzulwykva"
+    VNC_PASSWORD: "ocid1.vaultsecret.oc1.iad.amaaaaaagwh32gqaghvz6xkod4kxighsaru2huvuqul6jka5kr7qbi55rhzq"
+
+inputArtifacts:
+  - name: terraform_output
+    type: STAGE_ARTIFACT
+    location: ${OCI_PRIMARY_SOURCE_DIR}/terraform_output.json
+
+
+steps:
+  - type: Command
+    name: "checking terraform output"
+    command: |
+      cat ${OCI_PRIMARY_SOURCE_DIR}/terraform_output.json
+
+  - type: Command
+    name: "Installing Python"
+    command: |
+      dnf install python3.9 -y
+      yum install -y jq
+      alternatives --install /usr/bin/pip3 pip3 /usr/bin/pip3.9 3
+      alternatives --set pip3 /usr/bin/pip3.9
+
+  - type: Command
+    name: "Installing Ansible"
+    command: |
+      python3.9 -m pip install ansible
+      ansible --version
+
+  - type: Command
+    name: "Fix SSH Config Permissions"
+    command: |
+      chown root:root /etc/ssh/ssh_config.d/05-redhat.conf
+      chmod 644 /etc/ssh/ssh_config.d/05-redhat.conf
+      chown root:root /etc/crypto-policies/back-ends/openssh.config
+      chmod 644 /etc/crypto-policies/back-ends/openssh.config
+      chown root:root /etc/ssh/ssh_config.d || true
+      chmod 755 /etc/ssh/ssh_config.d || true
+
+  - type: Command
+    name: "Fetching SSH Key"
+    command: |
+      oci os object get --bucket-name "${env_name}-bucket" --name "${env_name}-private-bastion-key.pem" --file "${OCI_PRIMARY_SOURCE_DIR}/${env_name}-private-bastion-key.pem"
+      chmod 600 ${OCI_PRIMARY_SOURCE_DIR}/${env_name}-private-bastion-key.pem
+      oci os object get --bucket-name "${env_name}-bucket" --name "${env_name}-oke-bastion-key.pem" --file "${OCI_PRIMARY_SOURCE_DIR}/${env_name}-oke-bastion-key.pem"
+      chmod 600 ${OCI_PRIMARY_SOURCE_DIR}/${env_name}-oke-bastion-key.pem
+
+  - type: Command
+    name: "generating hosts.ini"
+    command: |
+      cd ${OCI_PRIMARY_SOURCE_DIR}
+      BASE_IP=$(jq -r '.bastion_private_ip.value.base' ${OCI_PRIMARY_SOURCE_DIR}/terraform_output.json)
+      ODI_IP=$(jq -r '.bastion_private_ip.value.odi' ${OCI_PRIMARY_SOURCE_DIR}/terraform_output.json)
+      OAP_IP=$(jq -r '.bastion_private_ip.value.oap' ${OCI_PRIMARY_SOURCE_DIR}/terraform_output.json)
+      cat > hosts.ini <<EOF
+      [base]
+      private-bastion ansible_host=$BASE_IP ansible_user=opc
+
+      [odi]
+      odi-bastion ansible_host=$ODI_IP ansible_user=opc
+
+      [oap]
+      oap-bastion ansible_host=$OAP_IP ansible_user=opc
+
+      [all_bastions:children]
+      base
+      odi
+      oap
+      EOF
+  - type: Command
+    name: "Running Ansible Playbook"
+    command: |
+      OKE_CLUSTER_ID=$(jq -r '.oke_cluster_id.value' ${OCI_PRIMARY_SOURCE_DIR}/terraform_output.json)
+      export ANSIBLE_HOST_KEY_CHECKING=False
+      cd ${OCI_PRIMARY_SOURCE_DIR}
+      ansible-playbook -i hosts.ini --private-key ${OCI_PRIMARY_SOURCE_DIR}/${env_name}-private-bastion-key.pem ${OCI_PRIMARY_SOURCE_DIR}/playbooks/bastion-prep.yml -e "oke_cluster_ocid=${OKE_CLUSTER_ID}" -e "vnc_password=${VNC_PASSWORD}" -e  "oci_fingerprint_b64=${OCI_FINGERPRINT}" -e "oci_private_key_b64=${OCI_PRIVATE_KEY}"
+
+  - type: Command
+    name: "Setting up k8 nodes"
+    command: |
+      curl -LO https://dl.k8s.io/release/v1.34.0/bin/linux/amd64/kubectl
+      export HTTP_PROXY=""
+      export HTTPS_PROXY=""
+      export NO_PROXY=""
+      export http_proxy=""
+      export https_proxy=""
+      export no_proxy=""
+      export ANSIBLE_HOST_KEY_CHECKING=False
+      cd ${OCI_PRIMARY_SOURCE_DIR}
+      OKE_CLUSTER_ID=$(jq -r '.oke_cluster_id.value' ${OCI_PRIMARY_SOURCE_DIR}/terraform_output.json)
+      chmod +x kubectl
+      oci ce cluster create-kubeconfig --cluster-id ${OKE_CLUSTER_ID} --file config --region us-ashburn-1 --token-version 2.0.0 --overwrite
+      ./kubectl get nodes -o wide --kubeconfig ${OCI_PRIMARY_SOURCE_DIR}/config  --no-headers | awk 'BEGIN {print "[nodes]"} {print $6 " ansible_user=opc"}' > nodes.ini
+      cat nodes.ini
+      ansible-playbook -i nodes.ini --private-key ${OCI_PRIMARY_SOURCE_DIR}/${env_name}-oke-bastion-key.pem ${OCI_PRIMARY_SOURCE_DIR}/playbooks/node-prep.yml
+
