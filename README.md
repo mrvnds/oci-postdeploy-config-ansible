@@ -1,8 +1,5 @@
-# oci-postdeploy-config-ansible
-Ansible-based automation for OCI post-deployment configuration. This playbook configures the bastion host and connected compute nodes with essential tools and settings required for cloud-native operations.
-
-
 # 🛠️ OCI Post-Deploy Configuration (Ansible)
+Ansible-based automation for OCI post-deployment configuration. This playbook configures the bastion host and connected compute nodes with essential tools and settings required for cloud-native operations.
 
 This repository provides **Ansible automation** for post-deployment configuration of the bastion host and compute nodes within a Oracle Cloud Infrastructure (OCI) environment.  
 It runs after infrastructure provisioning (e.g., via Terraform) and installs key tools, configures system-wide settings (including proxy) and enforces endpoint security.
